@@ -4,6 +4,8 @@ import re
 import shutil
 import traceback
 
+from typing import List
+
 import git
 from langchain_community.document_loaders import GitLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter, RecursiveUrlLoader
@@ -18,7 +20,8 @@ def fetch_github(
         state: GraphState,
         repository_clone_directory: str = "./data/temp_repo_clone",
         chunk_size: int = 1000,
-        chunk_overlap: int = 150,        
+        chunk_overlap: int = 150,
+        file_extensions: List[str] = None,
 ):
     """
     Fetch and process documents from a GitHub repository.
@@ -32,12 +35,21 @@ def fetch_github(
         repository_clone_directory (str): Directory path to clone or fetch the repository into.
         chunk_size (int): The maximum number of characters per document chunk.
         chunk_overlap (int): The number of overlapping characters between chunks.
+        file_extensions (List[str], optional): List of file extensions to include (lowercase, with leading dot).
+            Defaults to ['.txt', '.md', '.rst', '.py', '.png', '.jpg', '.svg', 
+            '.cff', '.json', '.yaml', '.sh', '.cfg', '.config', '.ipynb'].
 
     Returns:
         dict: A dictionary with the processed GitHub documents under "github_docs"
               and any encountered error messages under "error_messages".
     """
     logging.info("--- Node: fetch_github ---")
+
+    if file_extensions is None:
+        file_extensions = [
+            '.txt', '.md', '.rst', '.py', '.png', '.jpg', '.svg',
+            '.cff', '.json', '.yaml', '.sh', '.cfg', '.config', '.ipynb'
+        ]
 
     github_url = state['input_urls'].get('github')
     repo_path = repository_clone_directory
@@ -117,7 +129,14 @@ def fetch_github(
 
         # Split documents if loading/cloning was successful
         if raw_docs:
-            docs = text_splitter.split_documents(raw_docs)
+            # Filter raw_docs by allowed file extensions
+            filtered_docs = []
+            for doc in raw_docs:
+                source = doc.metadata.get('source', '')
+                _, ext = os.path.splitext(source)
+                if ext.casefold() in file_extensions:
+                    filtered_docs.append(doc)
+            docs = text_splitter.split_documents(filtered_docs)
             logging.info(f"Processed {len(docs)} docs from GitHub.")
 
         else:
