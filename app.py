@@ -1,63 +1,1195 @@
 # Uses the most recent version of LangChain (v0.3)
 
+import logging
 import os
+import re
+import shutil
+import traceback
+import git
+import json
+import tiktoken
+from json import JSONDecodeError
+import ast
+import textwrap
+import requests
+import pdfplumber
+import tempfile
+from datetime import datetime
+
+# Configure root logger
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+logging.getLogger("pdfminer.pdfpage").setLevel(logging.ERROR)
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings, AzureChatOpenAI, AzureOpenAIEmbeddings
-from langchain_community.tools.tavily_search import TavilySearchResults
 from langgraph.graph import StateGraph, END
+from typing import List, Optional, Union
+from pydantic import BaseModel, Field, ValidationError
+from typing import List, Dict, TypedDict, Optional
+from langchain_core.documents import Document
+from langchain_community.document_loaders import GitLoader, RecursiveUrlLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 
-from .agents.card import ModelCard
-from .agents.graph import GraphState, decide_next_step
-from .agents.extract import information_extraction
-from .agents.web_agents import fetch_documentation, fetch_github, fetch_publications
-from .agents.validate import synthesize_and_validate, handle_error
+
+# ------------------------------------
+# card.py
+# ------------------------------------
+class ModelCard(BaseModel):
+    """
+    Pydantic model defining standardized metadata fields for a scientific software,
+    model, dataset, or tool. Each field includes a default value and description
+    to support automated or manual generation of model cards.
+    """
+    capability_name: str = Field(default="N/A", description="The primary name of the software, model, dataset, or tool.")
+    brief_description: str = Field(default="N/A", description="A brief, one or two-sentence description of the software's main purpose and function.  What are the typical uses?  Who is currently using it?")
+    systems_covered: str = Field(default="N/A", description="The real-world systems the model represents (e.g., energy systems, water resources, climate, ecosystems, land use, socioeconomics, machine learning models). List the main ones.")
+    contact_name: str = Field(default="N/A", description="The name of the primary contact person for the software, if specified.")
+    contact_email: str = Field(default="N/A", description="The email address of the primary contact person.")
+    key_contributors: Union[List[str], str] = Field(default="N/A", description="Names or GitHub handles of other significant contributors mentioned.")
+    doi: str = Field(default="N/A", description="The current Digital Object Identifier (DOI) for citing the software, if available (check CITATION.cff or README).")
+    computational_requirements: Union[List[str], str] = Field(default="N/A", description="Hardware needed to run the software (e.g., Standard laptop, High-performance computing (HPC) cluster, GPU required).")
+    sponsoring_projects: Union[List[str], str] = Field(default="N/A", description="Projects or funding agencies that sponsored the development, if mentioned.")
+    figure: str = Field(default="N/A", description="Reference or URL to a key figure illustrating the software's structure or results, if described or linked in the text.")
+    figure_caption: str = Field(default="N/A", description="The caption associated with the key figure, if available in the text.")
+    spatial_resolution: Union[List[str], str] = Field(default="N/A", description="The spatial resolutions (range of tested grid spacing or distance between resolved features) at which the model can operate.  For example:  1 km, 5 arcmin, 0.5 degrees, Unstructured grid, Structured grid, Variable resolution, N/A if not applicable).  Return all that apply.")
+    geographic_scope: Union[List[str], str] = Field(default="N/A", description="The geographic area the model covers or is applied to (e.g., Global, CONUS, specific region, point location). Mention both potential and current applications if specified.")
+    temporal_resolution: Union[List[str], str] = Field(default="N/A", description="The time step or frequency of the model's calculations.  Either: seconds, minutes, hourly, daily, monthly, annual, 5-year, or decadal).  Return all that apply.")
+    temporal_range: Union[List[str], str] = Field(default="N/A", description="The time period the model simulates.  Either: historical, future, specific period.  Return all that apply.")
+    input_variables: Union[List[str], str] = Field(default="N/A", description="Key input data or variables required by the software.  List them.  Examples:  daily precipitation; power plant heat rate; locational marginal prices; gridded fractional land cover.")
+    output_variables: Union[List[str], str] = Field(default="N/A", description="Key output data or results generated by the software. List them. Examples:  instantaneous cyclone energy; fractional land cover; monthly runoff; atmospheric radiation; daily precipitation.")
+    interdependencies: Union[List[str], str] = Field(default="N/A", description="Other models, software libraries, or specific datasets the software relies on or commonly interacts with. For example, E3SM, GCAM, specific weather data).")
+    key_publications: Union[List[str], str] = Field(default="N/A", description="List of key publications as found in the documentation or as provided as PDF files by the user.")
+    category: Union[List[str], str] = Field(default="N/A", description="Select from:  Atmosphere, Physical Hydrology, Water Management, Wildfire, Energy, Multisectoral, Land Use Land Cover, Socioeconomics.  Return all that apply.")
+    license: str = Field(default="N/A", description="The name of the license associated with the software, model, dataset, or tool.")
+    current_version: str = Field(default="N/A", description="The current version of the software, model, dataset, or tool.")
 
 
-api_key = os.getenv("IM3_AZURE_OPENAI_API_KEY", default=None)
-endpoint = os.getenv("IM3_AZURE_OPENAI_ENDPOINT", default=None)
-deployment = "gpt-4o"
-openai_api_version = "2024-02-01"
+# ------------------------------------
+# graph.py
+# ------------------------------------
+class GraphState(TypedDict):
+    """
+    Represents the state of the graph as it progresses through document
+    processing and model card generation.
 
-llm = AzureChatOpenAI(
-    model_name="gpt-4o", 
-    temperature=0.1, 
-    api_key=api_key,
-    openai_api_version=openai_api_version,
-    azure_deployment=deployment,
-    azure_endpoint=endpoint,
-)
+    Attributes:
+        input_urls (Dict[str, str]): A dictionary of input source URLs, keyed by source name.
+        github_docs (Optional[List[Document]]): Documents retrieved from a GitHub repository.
+        docs_docs (Optional[List[Document]]): Documents retrieved from a Google Docs source.
+        extracted_info (Dict): Information extracted from the documents.
+        model_card (Optional[Dict]): A dictionary representing the generated model card.
+        error_messages (List[str]): A list of error messages encountered during processing.
+        validation_issues (Dict): Validation issues detected during processing.
+    """
+    input_urls: Dict[str, str]
+    github_docs: Optional[List[Document]]
+    docs_docs: Optional[List[Document]]
+    publication_docs: Optional[List[Document]]
+    extracted_info: Dict
+    model_card: Optional[Dict]
+    error_messages: List[str]
+    validation_issues: Dict
 
-embeddings = AzureOpenAIEmbeddings(
-    model="text-embedding-3-large",
-    azure_endpoint=endpoint,
-    api_key=api_key,
-    openai_api_version=openai_api_version,
-    chunk_size=512
-)
 
-# Initialize search tool (choose one)
-search_tool = TavilySearchResults(max_results=5)
+# ------------------------------------
+# Utilities for code skeleton extraction
+# ------------------------------------
+def extract_code_skeleton(code: str) -> Optional[str]:
+    """
+    Extract signatures and docstrings from Python code, omitting function/class bodies.
+    Returns None if the code cannot be parsed due to syntax errors.
+    """
+    try:
+        # Pre-clean code by removing common leading indentation
+        clean_code = textwrap.dedent(code)
+        # Only parse modules that begin with a top-level class or function definition
+        stripped = clean_code.lstrip()
+        if not (stripped.startswith("def ") or stripped.startswith("class ")):
+            return None
+        tree = ast.parse(clean_code)
+    except SyntaxError as e:
+        logging.debug(f"Skipping code skeleton due to SyntaxError: {e}")
+        return None
+    skeleton_lines = []
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            # Function signature
+            args = [arg.arg for arg in node.args.args]
+            sig = f"def {node.name}({', '.join(args)})"
+            if node.returns:
+                sig += f" -> {ast.unparse(node.returns)}"
+            skeleton_lines.append(sig + ":")
+            # Docstring if present
+            doc = ast.get_docstring(node)
+            if doc:
+                skeleton_lines.append(f'    """{doc}"""')
+        elif isinstance(node, ast.ClassDef):
+            # Class signature
+            skeleton_lines.append(f"class {node.name}:")
+            # Docstring if present
+            doc = ast.get_docstring(node)
+            if doc:
+                skeleton_lines.append(f'    """{doc}"""')
+    return "\n".join(skeleton_lines)
+
+def strip_code_bodies(state: GraphState) -> Dict:
+    """
+    Remove code bodies from Python documents, keeping only signatures and docstrings.
+    """
+    logging.info("--- Node: strip_code_bodies ---")
+    docs = state.get('github_docs', []) or []
+    errors = state.get('error_messages', []) or []
+    stripped_docs = []
+    for doc in docs:
+        source = doc.metadata.get('source', '')
+        if source.endswith('.py'):
+            skeleton = extract_code_skeleton(doc.page_content)
+            if skeleton:
+                stripped_docs.append(Document(page_content=skeleton, metadata=doc.metadata))
+            else:
+                logging.debug(f"Skipping Python file due to syntax errors: {source}")
+            continue
+        else:
+            stripped_docs.append(doc)
+    return {"github_docs": stripped_docs, "error_messages": errors}
+
+
+def decide_next_step(state: GraphState):
+    print("--- Decision ---")
+    errors = state.get('error_messages', [])
+    issues = state.get('validation_issues', {})
+
+    # Check for critical fetch errors first
+    if any("fetch failed" in msg.lower() for msg in errors):
+         print("Routing to handle_error due to fetch failure.")
+         return "error_handler"
+
+    # Check for critical extraction errors (e.g., no vector store)
+    if any("vector store initialization failed" in msg.lower() for msg in errors):
+         print("Routing to handle_error due to vector store failure.")
+         return "error_handler"
+
+    # Check for validation issues from synthesize_validate
+    if issues:
+        print("Routing to handle_error due to validation issues.")
+        return "error_handler"
+
+    # Check if model card dictionary exists (might be None if validation failed badly)
+    if not state.get('model_card'):
+         print("Routing to handle_error due to missing final model card data.")
+         return "error_handler"
+
+    print("Routing to END (Success).")
+    return END
+
+# ------------------------------------
+# web_agents.py
+# ------------------------------------
+def fetch_github(
+        state: GraphState,
+        repository_clone_directory: str = "./data/temp_repo_clone",
+        chunk_size: int = 1000,
+        chunk_overlap: int = 150,
+        file_extensions: List[str] = None,
+):
+    """
+    Fetch and process documents from a GitHub repository.
+
+    This function attempts to clone or fetch updates from a specified GitHub
+    repository, then loads and splits documents from it using the
+    RecursiveCharacterTextSplitter.
+
+    Args:
+        state (GraphState): The current graph state containing input URLs and error messages.
+        repository_clone_directory (str): Directory path to clone or fetch the repository into.
+        chunk_size (int): The maximum number of characters per document chunk.
+        chunk_overlap (int): The number of overlapping characters between chunks.
+        file_extensions (List[str], optional): List of file extensions to include (lowercase, with leading dot).
+            Defaults to ['.txt', '.md', '.rst', '.py', '.png', '.jpg', '.svg', 
+            '.cff', '.json', '.yaml', '.sh', '.cfg', '.config', '.r', '.cpp', 
+            '.c', '.f90', '.cmake', '.xml', 'makefile', '.h', '.rd', '.rmd', 
+            '.java', '.toml', '.poetry', '.pdf', '.bib'].
+
+    Returns:
+        dict: A dictionary with the processed GitHub documents under "github_docs"
+              and any encountered error messages under "error_messages".
+    """
+    logging.info("--- Node: fetch_github ---")
+    # Determine branch to use (default 'main', override via input_urls['github_branch'])
+    branch = state.get('input_urls', {}).get('github_branch', 'main')
+
+    if file_extensions is None:
+        file_extensions = [
+            '.txt', '.md', '.rst', '.png', '.jpg', '.svg',
+            '.cff', '.json', '.yaml', '.sh', '.cfg', '.config',
+            '.cmake', '.xml', 'makefile', '.rd', '.rmd', '.toml',
+            '.poetry', '.tex', '.bib', ''
+        ]
+
+    github_url = state['input_urls'].get('github')
+    repo_path = repository_clone_directory
+    errors = state.get('error_messages', []) or [] # Ensure errors list exists
+    docs = None
+    raw_docs = None
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+
+
+    if not github_url:
+        errors.append("Missing GitHub URL.")
+        return {"github_docs": None, "error_messages": errors}
+
+    try:
+        if os.path.exists(repository_clone_directory):
+            try:
+                logging.info(f"Repository directory exists at {repository_clone_directory}. Attempting git fetch...")
+
+                repo = git.Repo(repository_clone_directory)
+
+                if not repo.remotes:
+                     raise git.InvalidGitRepositoryError(f"{repository_clone_directory} exists but has no remotes.")
+                
+                logging.info("Fetching updates from all remotes (--all --prune)...")
+                repo.git.fetch('--all', '--prune')
+
+                logging.info("Git fetch complete.")
+                loader = GitLoader(repo_path=repository_clone_directory, branch=branch)
+
+                raw_docs = loader.load()
+
+            except git.InvalidGitRepositoryError as e:
+                 logging.error(f"Existing directory {repository_clone_directory} is not a valid Git repository: {e}. Re-cloning...")
+                 errors.append(f"InvalidGitRepositoryError for existing dir: {str(e)}")
+                 shutil.rmtree(repository_clone_directory)
+                 raw_docs = None
+
+            except git.GitCommandError as e:
+                logging.error(f"Git fetch error: {e}")
+                errors.append(f"Git fetch failed: {str(e)}. Check permissions/repo state.")
+                logging.info("Attempting to load documents from current state despite fetch error...")
+
+                try:
+                    loader = GitLoader(repo_path=repository_clone_directory, branch=branch)
+                    raw_docs = loader.load()
+
+                except Exception as load_e:
+                    logging.error(f"Failed to load docs after fetch error: {load_e}")
+                    errors.append(f"Failed to load docs after GitCommandError: {str(load_e)}")
+                    raw_docs = None
+
+            except Exception as e:
+                logging.error(f"Accessing existing repo failed: {e}. Attempting re-clone...")
+                errors.append(f"Error accessing existing repo: {str(e)}")
+
+                try:
+                    shutil.rmtree(repository_clone_directory)
+
+                except OSError as rm_e:
+                    logging.error(f"Failed to remove problematic directory: {rm_e}")
+                    errors.append(f"Failed to remove problematic directory: {str(rm_e)}")
+
+                raw_docs = None
+
+        # If the directory didn't exist OR we decided to re-clone
+        if not os.path.exists(repository_clone_directory) or raw_docs is None and github_url:
+             try:
+                logging.info(f"Cloning repository {github_url} to {repository_clone_directory}...")
+                loader = GitLoader(clone_url=github_url, repo_path=repository_clone_directory, branch=branch)
+                raw_docs = loader.load()
+                logging.info("Clone complete.")
+                
+             except Exception as e:
+                 logging.error(f"Cloning GitHub repo failed: {e}")
+                 errors.append(f"GitHub clone failed: {str(e)}")
+                 raw_docs = None
+
+        # Split documents if loading/cloning was successful
+        if raw_docs:
+            # Convert any PDF files to text Documents
+            converted_docs = []
+            for doc in raw_docs:
+                source = doc.metadata.get('source', '')
+                if source.lower().endswith('.pdf'):
+                    try:
+                        with pdfplumber.open(source) as pdf:
+                            text = ""
+                            for page in pdf.pages:
+                                text += page.extract_text() or ""
+                                text += "\n\n"
+                        converted_docs.append(Document(page_content=text, metadata=doc.metadata))
+                    except Exception as e:
+                        logging.error(f"Error converting PDF {source} in GitHub fetch: {e}")
+                        errors.append(f"PDF conversion error for {source}: {e}")
+                else:
+                    converted_docs.append(doc)
+            raw_docs = converted_docs
+            # Filter raw_docs by allowed file extensions and LICENSE files
+            filtered_docs = []
+            for doc in raw_docs:
+                source = doc.metadata.get('source', '')
+                _, ext = os.path.splitext(source)
+                name = os.path.basename(source)
+                # Keep by extension or include LICENSE files
+                if ext.casefold() in file_extensions \
+                   or name.lower() in ('license', 'license.md', 'license.txt'):
+                    filtered_docs.append(doc)
+            docs = text_splitter.split_documents(filtered_docs)
+            logging.info(f"Processed {len(docs)} docs from GitHub.")
+        else:
+            logging.warning("No documents loaded or processed from GitHub due to errors.")
+            docs = None
+
+    except Exception as e:
+
+        tb_str = traceback.format_exc()
+        logging.critical(f"CRITICAL ERROR in fetch_github: {e}\n{tb_str}")
+        errors.append(f"Critical fetch_github error: {str(e)}")
+        docs = None
+
+    return {"github_docs": docs, "error_messages": errors}
+
+
+def fetch_documentation(
+        state: GraphState,
+        timeout: int = 30,
+        chunk_size: int = 1000,
+        chunk_overlap: int = 150,
+        max_depth: int = 3,
+    ):
+    """
+    Fetch and process documents from a documentation URL.
+
+    This function loads HTML documents recursively from the specified Docs URL,
+    then splits them into smaller chunks using the RecursiveCharacterTextSplitter.
+
+    Args:
+        state (GraphState): The current graph state containing input URLs and error messages.
+        timeout (int): Timeout in seconds for loading the URL. Defaults to 30.
+        chunk_size (int): Maximum number of characters per chunk. Defaults to 1000.
+        chunk_overlap (int): Number of overlapping characters between chunks. Defaults to 150.
+        max_depth (int): Maximum depth for recursive URL loading. Defaults to 3.
+
+    Returns:
+        dict: A dictionary with the processed documents under "docs_docs" and any
+              encountered error messages under "error_messages".
+    """
+    logging.info("--- Node: fetch_documentation ---")
+
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+
+    urls = state['input_urls'].get('website_url_list', [])
+    errors = state.get('error_messages', []) or []
+    docs = []
+    if urls:
+        # Flatten nested lists
+        flat_urls = []
+        for u in urls:
+            if isinstance(u, list):
+                flat_urls.extend(u)
+            else:
+                flat_urls.append(u)
+        for url in flat_urls:
+            try:
+                loader = RecursiveUrlLoader(
+                    url=url,
+                    max_depth=max_depth,
+                    prevent_outside=True,
+                    use_async=False,
+                    timeout=timeout,
+                )
+                raw_docs = loader.load()
+                split = text_splitter.split_documents(raw_docs)
+                docs.extend(split)
+                logging.info(f"Fetched and split {len(split)} docs from Docs URL: {url}")
+            except Exception as e:
+                logging.error(f"ERROR fetching Docs URL {url}: {e}")
+                tb_str = traceback.format_exc()
+                errors.append(f"Docs URL fetch failed for {url}: {str(e)}\nTraceback: {tb_str}")
+    else:
+        errors.append("Missing Docs URL.")
+
+    return {
+        "docs_docs": docs,
+        "extracted_info": state.get('extracted_info', {}),
+        "error_messages": errors
+    }
+
+
+def fetch_publications(
+        state: GraphState,
+        max_context_length: int = 16000,
+        max_chars_per_query = 2000,
+    ):
+    """
+    Fetch key publications related to a software capability.
+
+    This function performs a web search using predefined queries to identify key
+    publications related to the specified software capability. The search results
+    are passed through an LLM to extract a representative citation string. If a
+    DOI is found within the citation, it is also extracted and stored.
+
+    Args:
+        state (GraphState): The current graph state containing extracted information
+            and error messages.
+        max_context_length (int): Maximum number of characters to pass into the LLM. Defaults to 16000.
+        max_chars_per_query (int): Maximum number of characters to use from each search result. Defaults to 2000.
+
+    Returns:
+        dict: A dictionary with updated 'extracted_info' and a list of 'error_messages'.
+    """
+    logging.info("--- Node: fetch_publications ---")
+
+    # Read flag for web searching publications; default False
+    search_web = state.get('search_web_for_publications', False)
+    if not search_web:
+        logging.info("search_web_for_publications flag is False; skipping web publication fetch.")
+        return {"extracted_info": state.get('extracted_info', {}), "error_messages": state.get('error_messages', [])}
+
+    extracted = state.get('extracted_info', {})
+    errors = state.get('error_messages', []) or []
+    capability_name = extracted.get('capability_name')
+
+    # Access global search tool (ensure initialized)
+    global search_tool, llm
+    if 'search_tool' not in globals() or search_tool is None:
+        errors.append("CRITICAL: Search tool not initialized.")
+        return {"extracted_info": extracted, "error_messages": errors}
+    
+    if 'llm' not in globals() or llm is None:
+        errors.append("CRITICAL: LLM not initialized for publication parsing.")
+        return {"extracted_info": extracted, "error_messages": errors}
+
+
+    if not capability_name:
+        logging.info("Skipping publication fetch: capability_name not available.")
+        return {"extracted_info": extracted, "error_messages": errors}
+
+    try:
+        logging.info(f"Searching publications related to: {capability_name}")
+        query1 = f"most important publication describing {capability_name} software"
+        query2 = f"\"Journal of Open Source Software\" {capability_name}"
+        query3 = f"citation OR paper {capability_name} model"
+        search_queries = [query1, query2, query3]
+
+        all_results_text = f"Search results for '{capability_name}':\n\n"
+
+        try:
+             for q in search_queries:
+                  logging.info(f"  Executing search: {q}")
+                  results = search_tool.run(q) # Assumes search_tool.run exists and returns string
+                  all_results_text += f"--- Results for query: {q} ---\n{results[:max_chars_per_query]}\n\n"
+        
+        except Exception as search_e:
+             logging.warning(f"Search query failed: {search_e}")
+             errors.append(f"Search query failed: {str(search_e)}")
+
+        if not all_results_text.strip():
+             logging.warning("No search results obtained.")
+             return {"extracted_info": extracted, "error_messages": errors}
+
+        parser_prompt_template = """
+        You are an expert academic researcher identifying key software publications.
+        Based on the following software name and web search results, identify the single most important publication describing the software itself.
+        Prioritize papers published in software journals (like JOSS) or papers explicitly introducing the model/software. Look for clear Title, Authors, Journal/Venue, Year, and DOI.
+
+        Format the output as a single citation string suitable for a 'key_publications' field (e.g., "Title. Authors (First Author Last, Second Author Last). Journal Vol(Issue), Pages, Year. DOI: XXXXX").
+        If multiple versions or papers exist, prefer the primary software description paper.
+        If no single key publication clearly describes the software based *only* on the provided snippets, output the exact phrase "No key publication identified.".
+
+        Software Name: {capability_name}
+
+        Web Search Results Snippets:
+        -------
+        {search_results_text}
+        -------
+
+        Key Publication String:
+        """
+        parser_prompt = ChatPromptTemplate.from_template(parser_prompt_template)
+        parser_chain = parser_prompt | llm | StrOutputParser()
+
+        logging.info("Asking LLM to identify key publication from search results...")
+        llm_input_text = all_results_text[:max_context_length]
+
+        key_pub_string = parser_chain.invoke({
+            "capability_name": capability_name, "search_results_text": llm_input_text
+        })
+        logging.info(f"LLM identified: {key_pub_string}")
+
+        if key_pub_string and "No key publication identified." not in key_pub_string:
+            extracted['key_publications'] = key_pub_string.strip()
+            # Reformat key publication(s) into Chicago style references
+            try:
+                chicago_template = """
+                You are an expert in academic citation formatting. Convert the following citation into a Chicago-style reference:
+
+                Citation Input:
+                {citation}
+
+                Chicago-style Reference:
+                """
+                chicago_prompt = ChatPromptTemplate.from_template(chicago_template)
+                chicago_chain = chicago_prompt | llm | StrOutputParser()
+                formatted = chicago_chain.invoke({"citation": extracted['key_publications']})
+                extracted['key_publications'] = formatted.strip()
+                logging.info(f"Formatted key_publications into Chicago style: {formatted}")
+            except Exception as fmt_e:
+                logging.warning(f"Could not format key_publications into Chicago style: {fmt_e}")
+            doi_match = re.search(r'(10\.\d{4,9}/[-._;()/:A-Z0-9]+)', key_pub_string, re.IGNORECASE)
+
+            if doi_match:
+                found_doi = doi_match.group(1)
+                
+                if not extracted.get('doi'):
+                    extracted['doi'] = found_doi
+                    logging.info(f"Extracted DOI ({found_doi}) and updated 'doi' field.")
+        else:
+            logging.info("No specific key publication identified by LLM.")
+
+    except Exception as e:
+        tb_str = traceback.format_exc()
+        logging.error(f"ERROR during publication fetch node: {e}\n{tb_str}")
+        errors.append(f"Publication fetch node error: {str(e)}")
+
+    return {"extracted_info": extracted, "error_messages": errors}
+
+
+# ------------------------------------
+# extract.py
+# ------------------------------------
+def information_extraction(state: GraphState) -> Dict:
+    """
+    Extract key metadata fields for the model card directly from repository documents.
+
+    This function aggregates the repository documents and uses the LLM to extract a JSON
+    dictionary containing fields for the ModelCard.
+
+    Args:
+        state (GraphState): The graph state with 'github_docs' and error messages.
+
+    Returns:
+        dict: Contains 'extracted_info' with the extracted metadata fields and
+              'error_messages' with any errors encountered.
+    """
+    logging.info("--- Node: extract_info ---")
+    docs = state.get('github_docs', []) or []
+    # Log token counts per file extension
+    try:
+        # Use the LLM's model name to select the correct encoding
+        enc = tiktoken.encoding_for_model(llm.model_name)
+        token_counts: Dict[str, int] = {}
+        for doc in docs:
+            source = doc.metadata.get('source', '')
+            ext = os.path.splitext(source)[1] or 'noext'
+            num_tokens = len(enc.encode(doc.page_content or ""))
+            token_counts[ext] = token_counts.get(ext, 0) + num_tokens
+        for ext, count in token_counts.items():
+            logging.info(f"--- Node: extract_info --- Extension {ext}: {count} tokens")
+    except Exception as e:
+        logging.warning(f"Token counting skipped: {e}")
+    errors = state.get('error_messages', []) or []
+    extracted: Dict = {}
+    # Prepare document text
+    docs_text = "\n\n".join(doc.page_content for doc in docs)
+    # Dynamically build list of field descriptions from the Pydantic ModelCard
+    field_descriptions = "\n".join(
+        f"- {name}: {field.description}"
+        for name, field in ModelCard.model_fields.items()
+    )
+    prompt_template = f"""
+You are an assistant that extracts metadata for a model card. The model card fields have the following names and descriptions:
+{field_descriptions}
+
+Given the following repository documents, extract these fields and output as a JSON object with the exact field names:
+
+Repository documents content:
+{{docs_text}}
+
+JSON Output:
+"""
+    prompt = ChatPromptTemplate.from_template(prompt_template)
+    chain = prompt | llm | StrOutputParser()
+    try:
+        result_str = chain.invoke({"docs_text": docs_text})
+        # Handle empty or whitespace-only output
+        if not result_str or not result_str.strip():
+            logging.warning("Empty output from LLM during information extraction")
+            errors.append("Empty LLM output for information extraction")
+            extracted = {}
+            return {"extracted_info": extracted, "error_messages": errors}
+        try:
+            # Remove Markdown code fences if present
+            cleaned = re.sub(r"```(?:json)?\s*", "", result_str)
+            cleaned = re.sub(r"```", "", cleaned).strip()
+            extracted = json.loads(cleaned)
+        except JSONDecodeError as jde:
+            logging.error(f"JSON parsing error during information extraction: {jde}")
+            errors.append(f"JSON parsing error: {jde}. Raw output: {cleaned!r}")
+            # Attempt to extract JSON substring
+            match = re.search(r'(\{.*\})', cleaned, re.DOTALL)
+            if match:
+                try:
+                    extracted = json.loads(match.group(1))
+                except JSONDecodeError as jde2:
+                    logging.error(f"Secondary JSON parsing error: {jde2}")
+                    errors.append(f"Secondary JSON parsing error: {jde2}. Substring: {match.group(1)!r}")
+                    extracted = {}
+            else:
+                extracted = {}
+    except Exception as e:
+        logging.error(f"Error during information extraction: {e}")
+        errors.append(str(e))
+    return {"extracted_info": extracted, "error_messages": errors}
+
+
+# ------------------------------------
+# fetch_publication_pdfs.py
+# ------------------------------------
+def fetch_publication_pdfs(state: GraphState) -> Dict:
+    """
+    Load local PDF files from a user-specified directory and extract their text for refinement.
+    """
+    logging.info("--- Node: fetch_publication_pdfs ---")
+
+    errors = state.get('error_messages', []) or []
+    pdf_docs = []
+
+    # Expect 'pdf_dir' in input_urls to specify where to load PDFs from
+    pdf_dir = state.get('input_urls', {}).get('pdf_dir')
+
+    if not pdf_dir:
+        errors.append("Missing PDF directory for publications ('pdf_dir' not provided).")
+        return {"publication_docs": [], "error_messages": errors}
+    
+    if not os.path.isdir(pdf_dir):
+        errors.append(f"PDF directory does not exist: {pdf_dir}")
+        return {"publication_docs": [], "error_messages": errors}
+    
+    # Process each PDF file in the directory
+    for fname in os.listdir(pdf_dir):
+        if fname.lower().endswith('.pdf'):
+            path = os.path.join(pdf_dir, fname)
+
+            try:
+                with pdfplumber.open(path) as pdf:
+                    text = ""
+                    for page in pdf.pages:
+                        text += page.extract_text() or ""
+                        text += "\n\n"
+
+                collected_content = Document(page_content=text, metadata={'source': path})   
+                pdf_docs.append(collected_content)
+
+            except Exception as e:
+                logging.error(f"Error processing PDF {path}: {e}")
+                errors.append(str(e))
+
+    return {"publication_docs": pdf_docs, "error_messages": errors}
+
+# ------------------------------------
+# refine_card_from_pdfs.py
+# ------------------------------------
+def refine_card_from_pdfs(state: GraphState) -> Dict:
+    """
+    Refine the model card by analyzing key publication texts.
+    """
+    logging.info("--- Node: refine_card_from_pdfs ---")
+    extracted = state.get('extracted_info', {}) or {}
+    errors = state.get('error_messages', []) or []
+    pdf_docs = state.get('publication_docs', []) or []
+
+    # Include field descriptions and current card state for context
+    field_descriptions = "\n".join(
+        f"- {name}: {field.description}"
+        for name, field in ModelCard.model_fields.items()
+    )
+    card_json = json.dumps(extracted)
+    escaped_card_json = card_json.replace("{", "{{").replace("}", "}}")
+
+    # Format existing documentation publications and generate Chicago-style citations for PDFs
+    existing = extracted.get('key_publications', [])
+    if isinstance(existing, str):
+        existing_list = [existing]
+    elif isinstance(existing, list):
+        existing_list = existing
+    else:
+        existing_list = []
+
+    # Log token count for PDF docs
+    try:
+        enc = tiktoken.encoding_for_model(llm.model_name)
+        total_pdf_tokens = sum(len(enc.encode(doc.page_content or "")) for doc in pdf_docs)
+        logging.info(f"--- Node: refine_card_from_pdfs --- Publication PDF content: {total_pdf_tokens} tokens")
+    except Exception as e:
+        logging.warning(f"Token counting for PDFs skipped: {e}")
+
+    # Prepare PDF excerpts text
+    pdf_excerpts = "\n\n".join(doc.page_content for doc in pdf_docs)
+
+    # Build a citation formatting prompt combining context, existing publications, and PDF excerpts
+    citation_prompt = f"""
+You are an assistant that refines the model card JSON based on publication PDFs.
+The model card fields have the following names and descriptions:
+{field_descriptions}
+
+Current model card JSON state:
+{escaped_card_json}
+
+1) Reformat these existing publication entries:
+{{existing_pubs}}
+
+2) For each of these PDF excerpts (first-page text), generate a Chicago-style citation:
+{{pdf_excerpts}}
+
+Output as JSON with only the field to update:
+{{{{ 
+  "key_publications": [/* list of formatted citations */]
+}}}}
+"""
+    cite_prompt = ChatPromptTemplate.from_template(citation_prompt)
+    cite_chain = cite_prompt | llm | StrOutputParser()
+
+    try:
+        input_vars = {
+            "existing_pubs": "\n".join(existing_list),
+            "pdf_excerpts": pdf_excerpts
+        }
+        result_str = cite_chain.invoke(input_vars)
+        # Clean and parse JSON
+        cleaned = re.sub(r"```(?:json)?\s*", "", result_str)
+        cleaned = re.sub(r"```", "", cleaned).strip()
+        citations_json = json.loads(cleaned)
+        if "key_publications" in citations_json:
+            extracted['key_publications'] = citations_json['key_publications']
+    except Exception as e:
+        logging.error(f"Error during citation formatting in refine_card_from_pdfs: {e}")
+        errors.append(str(e))
+    # Fallback: ensure any PDF filenames are included as DOIs if missing
+    for doc in pdf_docs:
+        source_path = doc.metadata.get('source', '')
+        filename = os.path.basename(source_path)
+        if filename.lower().endswith('.pdf'):
+            base = filename[:-4]
+            # Convert filename format "10.21105.joss.03221" to DOI "10.21105/joss.03221"
+            doi = base.replace('.', '/', 1)
+            existing = extracted.get('key_publications', [])
+            if isinstance(existing, str):
+                existing_list = [existing]
+            else:
+                existing_list = existing
+            if doi not in existing_list:
+                existing_list.append(doi)
+            extracted['key_publications'] = existing_list
+
+    # Remove entries that are neither Chicago-style citations nor valid DOIs
+    pubs = extracted.get('key_publications', [])
+    if isinstance(pubs, list):
+        filtered = []
+        doi_pattern = re.compile(r'^10\.\d{4,9}/[-._;()/:A-Z0-9]+$', re.IGNORECASE)
+        for entry in pubs:
+            if not isinstance(entry, str):
+                continue
+            # Keep if Chicago formatted (heuristic: at least 3 segments) or matches DOI pattern
+            if len(entry.split('. ')) >= 3 or doi_pattern.match(entry):
+                filtered.append(entry)
+        extracted['key_publications'] = filtered
+    # Merge refined fields without overwriting existing non-default values
+    merged = extracted.copy()
+    defaults = {"N/A", ""}
+    # No further refinement/merging needed for now; if more fields are refined, merge logic can be added here
+    extracted = merged
+    return {"extracted_info": extracted, "error_messages": errors}
+
+
+# ------------------------------------
+# refine_card_from_webdata.py
+# ------------------------------------
+def refine_card_from_webdata(state: GraphState) -> Dict:
+    """
+    Refine the model card by appending details from website documentation.
+    """
+    logging.info("--- Node: refine_card_from_webdata ---")
+    extracted = state.get('extracted_info', {}) or {}
+    errors = state.get('error_messages', []) or []
+    website_docs = state.get('docs_docs', []) or []
+
+    # Include field descriptions and current card state for context
+    field_descriptions = "\n".join(
+        f"- {name}: {field.description}"
+        for name, field in ModelCard.model_fields.items()
+    )
+    card_json = json.dumps(extracted)
+    escaped_card_json = card_json.replace("{", "{{").replace("}", "}}")
+
+    # Prepare documentation text
+    docs_text = "\n\n".join(doc.page_content for doc in website_docs)
+    # Log token count for website docs
+    try:
+        enc = tiktoken.encoding_for_model(llm.model_name)
+        total_web_tokens = sum(len(enc.encode(doc.page_content or "")) for doc in website_docs)
+        logging.info(f"--- Node: refine_card_from_webdata --- Website content: {total_web_tokens} tokens")
+    except Exception as e:
+        logging.warning(f"Token counting for website content skipped: {e}")
+
+    prompt_template = f"""
+You are an assistant that appends additional metadata to an existing model card JSON based on website documentation.
+The model card fields have the following names and descriptions:
+{field_descriptions}
+
+Do not overwrite any non-default existing values; only add new fields or fill in missing ones.
+
+Initial card JSON:
+{escaped_card_json}
+
+Website documentation content:
+{{docs_text}}
+
+Output as JSON with only the fields to update or append:
+"""
+    prompt = ChatPromptTemplate.from_template(prompt_template)
+    chain = prompt | llm | StrOutputParser()
+
+    try:
+        result_str = chain.invoke({"docs_text": docs_text})
+        # Clean and parse JSON
+        cleaned = re.sub(r"```(?:json)?\s*", "", result_str)
+        cleaned = re.sub(r"```", "", cleaned).strip()
+        updates = json.loads(cleaned)
+        # Merge updates without overwriting existing non-default values
+        defaults = {"N/A", ""}
+        for key, value in updates.items():
+            current = extracted.get(key)
+            if value is None:
+                continue  # Skip None values to prevent overwriting with invalid input
+            # Do not overwrite current_version if already set by GitHub
+            if key == "current_version" and extracted.get("current_version") not in (None, "N/A"):
+                logging.info("Skipping overwrite of current_version since GitHub version is present")
+                continue
+
+            if current in defaults or current is None or (isinstance(current, list) and not current):
+                extracted[key] = value
+            elif isinstance(current, list) and isinstance(value, list):
+                try:
+                    combined = list(dict.fromkeys(current + value))
+                    extracted[key] = combined
+                except TypeError:
+                    logging.warning(f"Skipping invalid merge for field '{key}' due to unhashable list entries.")
+    except Exception as e:
+        logging.error(f"Error during webdata refinement: {e}")
+        errors.append(str(e))
+
+    return {"extracted_info": extracted, "error_messages": errors}
+
+
+# ------------------------------------
+# fetch_latest_release.py
+# ------------------------------------
+def fetch_latest_release(state: GraphState) -> Dict:
+    """
+    Fetch the latest GitHub release tag and store it as current_version.
+    """
+    logging.info("--- Node: fetch_latest_release ---")
+    extracted = state.get('extracted_info', {}) or {}
+    errors = state.get('error_messages', []) or []
+    git_url = state.get('input_urls', {}).get('github')
+
+    if not git_url:
+        errors.append("No GitHub URL provided for latest-release lookup.")
+        return {"extracted_info": extracted, "error_messages": errors}
+
+    try:
+        # turn "https://github.com/owner/repo" into "owner/repo"
+        owner_repo = git_url.rstrip("/").split("github.com/")[1]
+        api_url = f"https://api.github.com/repos/{owner_repo}/releases/latest"
+
+        resp = requests.get(api_url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        tag = data.get("tag_name")
+        if tag:
+            previous = extracted.get("current_version")
+            # Override any existing non-default version
+            if previous and previous != tag and previous != "N/A":
+                logging.info(f"Overriding existing current_version '{previous}' with latest release '{tag}'")
+            extracted["current_version"] = tag
+            logging.info(f"Retrieved latest release tag: {tag}")
+        else:
+            logging.warning("No tag_name field in GitHub response.")
+            errors.append("GitHub release JSON missing tag_name.")
+    except Exception as e:
+        logging.warning(f"Failed to retrieve latest release: {e}")
+        errors.append(f"Latest-release lookup error: {e}")
+
+    return {"extracted_info": extracted, "error_messages": errors}
+
+# ------------------------------------
+# fetch_github_contributors.py
+# ------------------------------------
+def fetch_github_contributors(state: GraphState) -> Dict:
+    """
+    Fetch the list of GitHub repository contributors and store their logins as key_contributors.
+    """
+    logging.info("--- Node: fetch_github_contributors ---")
+    extracted = state.get('extracted_info', {}) or {}
+    errors = state.get('error_messages', []) or []
+    git_url = state.get('input_urls', {}).get('github')
+
+    if not git_url:
+        errors.append("No GitHub URL provided for contributors lookup.")
+        return {"extracted_info": extracted, "error_messages": errors}
+
+    try:
+        # Extract "owner/repo" from the URL
+        owner_repo = git_url.rstrip("/").split("github.com/")[1]
+        api_url = f"https://api.github.com/repos/{owner_repo}/contributors"
+
+        resp = requests.get(api_url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Extract login names along with actual names where available
+        contributors = []
+        for entry in data:
+            login = entry.get("login")
+            if not login:
+                continue
+            # Default to login if no real name found
+            display_name = login
+            try:
+                user_api_url = entry.get("url")
+                user_resp = requests.get(user_api_url, timeout=10)
+                user_resp.raise_for_status()
+                user_data = user_resp.json()
+                name = user_data.get("name")
+                if name:
+                    display_name = name
+            except Exception as e:
+                logging.warning(f"Could not fetch user details for {login}: {e}")
+            # Format as "Name (@login)" if name differs, otherwise just login
+            if display_name and display_name.lower() != login.lower():
+                contributors.append(f"{display_name} (@{login})")
+            else:
+                contributors.append(login)
+
+        if contributors:
+            previous = extracted.get("key_contributors")
+            if previous and previous != "N/A":
+                logging.info(f"Overriding existing key_contributors '{previous}' with fetched contributors list")
+            extracted["key_contributors"] = contributors
+            logging.info(f"Retrieved {len(contributors)} contributors")
+        else:
+            logging.warning("No contributors found in GitHub response.")
+            errors.append("GitHub contributors JSON empty or missing logins.")
+    except Exception as e:
+        logging.warning(f"Failed to retrieve GitHub contributors: {e}")
+        errors.append(f"Contributors lookup error: {e}")
+
+    return {"extracted_info": extracted, "error_messages": errors}
+
+# ------------------------------------
+# validate.py
+# ------------------------------------
+def synthesize_and_validate(state: GraphState) -> Dict:
+    """
+    Synthesize and validate the extracted metadata into a ModelCard.
+
+    This function constructs a ModelCard from the extracted information,
+    applies Pydantic validation, and captures any validation errors.
+
+    Args:
+        state (GraphState): The current graph state containing 'extracted_info'
+            and 'error_messages'.
+
+    Returns:
+        dict: A dictionary with:
+            - 'model_card': The validated model card data (or raw extracted_info if validation failed).
+            - 'validation_issues': A list of validation error details (empty if none).
+            - 'error_messages': Any error messages encountered, including validation failures.
+    """
+    logging.info("--- Node: synthesize_validate ---")
+    errors = state.get('error_messages', []) or []
+    extracted_info = state.get('extracted_info', {}) or {}
+    # Coerce None values for string fields to "N/A" to satisfy Pydantic string requirements
+    for key in ['contact_email', 'license']:
+        if extracted_info.get(key) is None:
+            extracted_info[key] = "N/A"
+
+    # Coerce systems_covered list into a comma-separated string for Pydantic validation
+    sys_cov = extracted_info.get('systems_covered')
+    if isinstance(sys_cov, list):
+        extracted_info['systems_covered'] = ", ".join(sys_cov)
+
+    # Normalize computational_requirements into expected categories
+    comp_req_val = extracted_info.get('computational_requirements', '')
+    if isinstance(comp_req_val, list):
+        comp_req_str = ' '.join(comp_req_val).lower()
+    else:
+        comp_req_str = str(comp_req_val).lower()
+    if 'gpu' in comp_req_str:
+        extracted_info['computational_requirements'] = "High Performance Computing - GPU"
+    elif any(keyword in comp_req_str for keyword in ('cpu', 'hpc', 'cluster')):
+        extracted_info['computational_requirements'] = "High Performance Computing - CPU"
+    else:
+        extracted_info['computational_requirements'] = "Standard Computing"
+
+    # Normalize temporal_range into expected categories
+    temp_range_raw = extracted_info.get('temporal_range', '')
+    tr_lower = temp_range_raw.lower() if isinstance(temp_range_raw, str) else ''
+    # Determine based on keywords and year ranges
+    historic_flag = 'histor' in tr_lower
+    future_flag = 'future' in tr_lower
+    # Year-based detection
+    current_year = datetime.now().year
+    years = [int(y) for y in re.findall(r'(\d{4})', tr_lower)]
+    if years:
+        if any(y < current_year for y in years):
+            historic_flag = True
+        if any(y >= current_year for y in years):
+            future_flag = True
+    # Build categories list
+    tr_categories = []
+    if historic_flag:
+        tr_categories.append('Historical')
+    if future_flag:
+        tr_categories.append('Future')
+    # Default to Historical if no flags set
+    if not tr_categories:
+        tr_categories.append('Historical')
+    extracted_info['temporal_range'] = tr_categories
+
+    # Normalize category into expected set
+    raw_cat = extracted_info.get('category', [])
+    allowed_cats = [
+        "Atmosphere", "Physical Hydrology", "Water Management", "Wildfire",
+        "Energy", "Multisectoral", "Land Use Land Cover", "Socioeconomics"
+    ]
+    # Ensure list form
+    if isinstance(raw_cat, str):
+        items = [c.strip() for c in raw_cat.split(',')]
+    elif isinstance(raw_cat, list):
+        items = raw_cat
+    else:
+        items = []
+    normalized_cats = []
+    for item in items:
+        low = item.lower()
+        for cat in allowed_cats:
+            if cat.lower() in low or low in cat.lower():
+                normalized_cats.append(cat)
+                break
+    if not normalized_cats:
+        normalized_cats = ["Multisectoral"]
+    extracted_info['category'] = normalized_cats
+
+    validation_issues = []
+    model_card = None
+
+    try:
+        card = ModelCard(**extracted_info)
+        model_card = card.model_dump()
+    except ValidationError as e:
+        # Capture validation errors
+        validation_issues = e.errors()
+        # Log each issue
+        for issue in validation_issues:
+            logging.error(f"Validation issue: {issue}")
+            errors.append(issue.get('msg', str(issue)))
+        # Fallback to raw data
+        model_card = extracted_info
+
+    return {
+        "model_card": model_card,
+        "validation_issues": validation_issues,
+        "error_messages": errors,
+    }
+
+
+# ------------------------------------
+# error_handler.py
+# ------------------------------------
+def handle_error(state: GraphState) -> Dict:
+    """
+    Handle errors encountered in the workflow by logging them and consolidating validation issues.
+
+    Args:
+        state (GraphState): The current graph state containing 'error_messages' and 'validation_issues'.
+
+    Returns:
+        dict: A dictionary with 'error_messages' updated to include any validation issues.
+    """
+    logging.info("--- Node: handle_error ---")
+    errors = state.get('error_messages', []) or []
+    issues = state.get('validation_issues', []) or []
+    # Merge validation issues into error messages
+    for issue in issues:
+        errors.append(f"Validation issue: {issue}")
+    logging.error(f"Workflow encountered errors: {errors}")
+    return {"error_messages": errors}
+
 
 
 if __name__ == "__main__":
+
+
+    api_key = os.getenv("IM3_AZURE_OPENAI_API_KEY", default=None)
+    endpoint = os.getenv("IM3_AZURE_OPENAI_ENDPOINT", default=None)
+    deployment = "gpt-4o"
+    openai_api_version = "2024-02-01"
+
+    llm = AzureChatOpenAI(
+        model_name="gpt-4o", 
+        temperature=0.1, 
+        api_key=api_key,
+        openai_api_version=openai_api_version,
+        azure_deployment=deployment,
+        azure_endpoint=endpoint,
+    )
+
+    embeddings = AzureOpenAIEmbeddings(
+        model="text-embedding-3-large",
+        azure_endpoint=endpoint,
+        api_key=api_key,
+        openai_api_version=openai_api_version,
+        chunk_size=512
+    )
+
+    # Initialize search tool (choose one)
+    # search_tool = TavilySearchResults(max_results=5)
 
     # --- Build the Graph ---
     workflow = StateGraph(GraphState)
 
     # Add nodes
     workflow.add_node("fetch_github", fetch_github)
-    workflow.add_node("fetch_documentation", fetch_documentation)
+    workflow.add_node("strip_code_bodies", strip_code_bodies)
     workflow.add_node("extract_info", information_extraction)
-    workflow.add_node("fetch_publications", fetch_publications) # Added publication node
+    workflow.add_node("fetch_publications", fetch_publications)
+    workflow.add_node("fetch_publication_pdfs", fetch_publication_pdfs)
+    workflow.add_node("fetch_documentation", fetch_documentation)
+    workflow.add_node("refine_card_from_pdfs", refine_card_from_pdfs)
+    workflow.add_node("refine_card_from_webdata", refine_card_from_webdata)
+    workflow.add_node("fetch_latest_release", fetch_latest_release)
+    workflow.add_node("fetch_github_contributors", fetch_github_contributors)
     workflow.add_node("synthesize_validate", synthesize_and_validate)
     workflow.add_node("error_handler", handle_error)
 
     # Define edges
     workflow.set_entry_point("fetch_github")
-    workflow.add_edge("fetch_github", "fetch_documentation")
-    workflow.add_edge("fetch_documentation", "extract_info")
-    workflow.add_edge("extract_info", "fetch_publications") # -> Fetch publications after initial extraction
-    workflow.add_edge("fetch_publications", "synthesize_validate") # -> Synthesize after fetching publications
+    workflow.add_edge("fetch_github", "fetch_latest_release")
+    workflow.add_edge("fetch_latest_release", "strip_code_bodies")
+    workflow.add_edge("strip_code_bodies", "extract_info")
+    workflow.add_edge("extract_info", "fetch_publications")
+    workflow.add_edge("fetch_publications", "fetch_documentation")
+    workflow.add_edge("fetch_documentation", "fetch_publication_pdfs")
+    workflow.add_edge("fetch_publication_pdfs", "refine_card_from_pdfs")
+    workflow.add_edge("refine_card_from_pdfs", "refine_card_from_webdata")
+    workflow.add_edge("refine_card_from_webdata", "fetch_github_contributors")
+    workflow.add_edge("fetch_github_contributors", "synthesize_validate")
 
     # Conditional edge after synthesis/validation
     workflow.add_conditional_edges(
@@ -68,24 +1200,32 @@ if __name__ == "__main__":
             END: END
         }
     )
-    workflow.add_edge("error_handler", END)
 
     # Compile the graph
     app = workflow.compile()
 
+
+
     # --- Run the Graph ---
-    github_url = "https://github.com/IMMM-SFA/mosartwmpy"
-    # Point to base URL, let RecursiveUrlLoader handle paths
-    docs_url = "https://mosartwmpy.readthedocs.io/en/latest/"
+    github_url = "https://github.com/ClimateGlobalChange/tempestextremes"
+    branch_name = "master"
+
+    # directory of key publications
+    pdf_dir = "./data/publications"
+
+    # websites to mine
+    website_url_list = ["https://climate.ucdavis.edu/tempestextremes.php"]
 
     inputs = {
-        "input_urls": {"github": github_url, "docs": docs_url},
+        "search_web_for_publications": False,
+        "input_urls": {"github": github_url, "pdf_dir": pdf_dir, "website_url_list": [website_url_list], "github_branch": branch_name},
         "extracted_info": {}, # Start with empty extracted info
         "error_messages": [],
         "validation_issues": {},
         "model_card": None, # Ensure model_card starts as None
         "github_docs": None, # Ensure docs start as None
         "docs_docs": None,   # Ensure docs start as None
+        "publication_docs": None,
     }
 
     print("Starting graph execution...")
@@ -107,8 +1247,9 @@ if __name__ == "__main__":
         try:
             # Create the final Pydantic object from the dictionary state
             final_card = ModelCard(**final_card_data)
-            # Use model_dump_json for Pydantic v2
+
             print(final_card.model_dump_json(indent=2))
+
         except Exception as e:
             print(f"Error creating/printing final ModelCard object: {e}")
             print("Raw dictionary data:", final_card_data)
@@ -121,4 +1262,3 @@ if __name__ == "__main__":
             print("Validation Issues:", final_issues)
         
         print("Partial Card Data:", final_card_data) # Uncomment to see potentially invalid data
-
