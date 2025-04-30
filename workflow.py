@@ -28,6 +28,14 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 import json
 
+from io import BytesIO
+from PIL import Image
+from typing import Union, List
+
+from pptx import Presentation
+from pptx.util import Pt
+from pptx.dml.color import RGBColor
+
 
 # Configure root logger
 logging.basicConfig(
@@ -108,6 +116,116 @@ class GraphState(TypedDict):
     publication_extracted_info: Dict
     publication_errors: List[str]
     raw_extracted_info: Dict
+
+
+
+def apply_text(
+    prs: Presentation,
+    slide_index: int,
+    shape_index: int,
+    text: str,
+    font_name: str = "Calibri",
+    font_size: int = 14,
+    font_italic: bool = False,
+    font_color = RGBColor(0, 0, 0), # black
+    bold_items: Union[None, List[str]] = None,
+) -> None:
+
+    # retrieve shape
+    shape = prs.slides[slide_index].shapes[shape_index]
+
+    # write text to shape
+    shape.text = text
+
+    # apply formatting
+    for paragraph in shape.text_frame.paragraphs:
+        for run in paragraph.runs:
+            run.font.name   = font_name
+            run.font.size   = Pt(font_size)
+            run.font.italic = font_italic
+            run.font.color.rgb = font_color
+
+            if bold_items is not None:
+                for item in bold_items:
+                    if run.text.startswith(item):
+                        run.font.bold = True
+
+
+def apply_figure(
+    prs: Presentation,
+    slide_index: int,
+    shape_index: int,
+    image_url: str,
+) -> None:
+
+    # download image & get its size
+    resp = requests.get(image_url)
+    resp.raise_for_status()
+    img_bytes = BytesIO(resp.content)
+    img = Image.open(img_bytes)
+    orig_w, orig_h = img.size
+    
+    # open PPT and grab the target shape
+    slide = prs.slides[slide_index]
+    shape = slide.shapes[shape_index]
+    
+    # record the shape’s position & size
+    left, top, w, h = shape.left, shape.top, shape.width, shape.height
+    
+    # compute scaling to fit entire image within the rectangle
+    scale = min(w / orig_w, h / orig_h)
+    scaled_w = int(orig_w * scale)
+    scaled_h = int(orig_h * scale)
+    
+    # compute offsets to center the image in the rectangle
+    offset_left = left + (w  - scaled_w) // 2
+    offset_top = top  + (h  - scaled_h) // 2
+    
+    # insert the picture at the computed size & position
+    img_bytes.seek(0)
+    pic = slide.shapes.add_picture(
+        img_bytes,
+        offset_left,
+        offset_top,
+        width=scaled_w,
+        height=scaled_h
+    )
+    
+    # hide the original rectangle so only the image shows
+    shape.fill.background()
+    if shape.line:
+        shape.line.fill.background()
+
+
+def apply_table_cell(
+    prs: Presentation,
+    slide_index: int,
+    shape_index: int,
+    row_index: int,
+    column_index: int,
+    text: str,
+    font_name: str = "Calibri",
+    font_size: int = 14,
+    font_italic: bool = False,
+    font_color = RGBColor(0, 0, 0), # black
+) -> None:
+
+    # get shape object
+    shape = prs.slides[slide_index].shapes[shape_index]
+
+    # get cell
+    cell = shape.table.cell(row_index, column_index)
+
+    # apply text
+    cell.text = text
+
+    # apply font size to every run in that cell
+    for paragraph in cell.text_frame.paragraphs:
+        for run in paragraph.runs:
+            run.font.name   = font_name
+            run.font.size   = Pt(font_size)
+            run.font.italic = font_italic
+            run.font.color.rgb = font_color    
 
 
 def fetch_github_release(state: GraphState) -> Dict:
