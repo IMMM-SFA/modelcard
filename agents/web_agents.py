@@ -37,7 +37,8 @@ def fetch_github(
         chunk_overlap (int): The number of overlapping characters between chunks.
         file_extensions (List[str], optional): List of file extensions to include (lowercase, with leading dot).
             Defaults to ['.txt', '.md', '.rst', '.py', '.png', '.jpg', '.svg', 
-            '.cff', '.json', '.yaml', '.sh', '.cfg', '.config', '.ipynb'].
+            '.cff', '.json', '.yaml', '.sh', '.cfg', '.config', '.ipynb', '.r', '.cpp', 
+            '.c', '.f90', '.cmake', '.xml', 'makefile', '.h', '.rd', '.rmd', '.java'].
 
     Returns:
         dict: A dictionary with the processed GitHub documents under "github_docs"
@@ -48,7 +49,8 @@ def fetch_github(
     if file_extensions is None:
         file_extensions = [
             '.txt', '.md', '.rst', '.py', '.png', '.jpg', '.svg',
-            '.cff', '.json', '.yaml', '.sh', '.cfg', '.config', '.ipynb'
+            '.cff', '.json', '.yaml', '.sh', '.cfg', '.config', '.ipynb', '.r', '.cpp', 
+            '.c', '.f90', '.cmake', '.xml', 'makefile', '.h', '.rd', '.rmd', '.java'
         ]
 
     github_url = state['input_urls'].get('github')

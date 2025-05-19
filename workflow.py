@@ -27,6 +27,9 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 import json
+import pandas as pd
+import gdown
+import numpy as np
 
 from io import BytesIO
 from PIL import Image
@@ -117,6 +120,158 @@ class GraphState(TypedDict):
     publication_errors: List[str]
     raw_extracted_info: Dict
 
+
+def apply_text(
+    slide_index: int,
+    shape_index: int,
+    text: str,
+    font_name: str = "Calibri",
+    font_size: int = 14,
+    font_italic: bool = False,
+    font_color = RGBColor(0, 0, 0), # black
+    bold_items: Union[None, List[str]] = None,
+) -> None:
+
+    # retrieve shape
+    shape = prs.slides[slide_index].shapes[shape_index]
+
+    # write text to shape
+    shape.text = text
+
+    # apply formatting
+    for paragraph in shape.text_frame.paragraphs:
+        for run in paragraph.runs:
+            run.font.name   = font_name
+            run.font.size   = Pt(font_size)
+            run.font.italic = font_italic
+            run.font.color.rgb = font_color
+
+            if bold_items is not None:
+                for item in bold_items:
+                    if run.text.startswith(item):
+                        run.font.bold = True
+
+
+def apply_figure(
+    slide_index: int,
+    shape_index: int,
+    image_url: str,
+) -> None:
+
+    # download image & get its size
+    resp = requests.get(image_url)
+    resp.raise_for_status()
+    img_bytes = BytesIO(resp.content)
+    img = Image.open(img_bytes)
+    orig_w, orig_h = img.size
+    
+    # open PPT and grab the target shape
+    slide = prs.slides[slide_index]
+    shape = slide.shapes[shape_index]
+    
+    # record the shape’s position & size
+    left, top, w, h = shape.left, shape.top, shape.width, shape.height
+    
+    # compute scaling to fit entire image within the rectangle
+    scale = min(w / orig_w, h / orig_h)
+    scaled_w = int(orig_w * scale)
+    scaled_h = int(orig_h * scale)
+    
+    # compute offsets to center the image in the rectangle
+    offset_left = left + (w  - scaled_w) // 2
+    offset_top = top  + (h  - scaled_h) // 2
+    
+    # insert the picture at the computed size & position
+    img_bytes.seek(0)
+    pic = slide.shapes.add_picture(
+        img_bytes,
+        offset_left,
+        offset_top,
+        width=scaled_w,
+        height=scaled_h
+    )
+    
+    # hide the original rectangle so only the image shows
+    shape.fill.background()
+    if shape.line:
+        shape.line.fill.background()
+
+
+def apply_table_cell(
+    slide_index: int,
+    shape_index: int,
+    row_index: int,
+    column_index: int,
+    text: str,
+    font_name: str = "Calibri",
+    font_size: int = 14,
+    font_italic: bool = False,
+    font_color = RGBColor(0, 0, 0), # black
+) -> None:
+
+    # get shape object
+    shape = prs.slides[slide_index].shapes[shape_index]
+
+    # get cell
+    cell = shape.table.cell(row_index, column_index)
+
+    # apply text
+    cell.text = text
+
+    # apply font size to every run in that cell
+    for paragraph in cell.text_frame.paragraphs:
+        for run in paragraph.runs:
+            run.font.name   = font_name
+            run.font.size   = Pt(font_size)
+            run.font.italic = font_italic
+            run.font.color.rgb = font_color    
+
+
+def download_gdrive_public_file(file_id_or_url, destination_path):
+    """
+    Downloads a publicly shared file from Google Drive using its ID or URL.
+
+    Args:
+        file_id_or_url (str): The Google Drive file ID or its sharable URL.
+                              (e.g., '1ZdR3L3qP_qF2X...' or
+                               'https://drive.google.com/file/d/1ZdR3L3qP_qF2X.../view?usp=sharing')
+        destination_path (str): The local path (including filename) where the file
+                                 should be saved. (e.g., 'my_downloaded_image.jpg' or 'data/archive.zip')
+
+    Returns:
+        str: The path to the downloaded file if successful, None otherwise.
+    """
+    try:
+        # Ensure the output directory exists
+        output_dir = os.path.dirname(destination_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            print(f"Created directory: {output_dir}")
+
+        print(f"Attempting to download file to: {destination_path}")
+        output = gdown.download(url=file_id_or_url, output=destination_path, quiet=False, fuzzy=True)
+
+        if output and os.path.exists(output):
+            print(f"File downloaded successfully: {output}")
+            return output
+        else:
+            # gdown might return None or the path even if it fails internally for some large files before completion
+            # So, an explicit check if the file exists and has size.
+            if os.path.exists(destination_path) and os.path.getsize(destination_path) > 0:
+                print(f"File downloaded successfully (verified): {destination_path}")
+                return destination_path
+            else:
+                print(f"Download failed. Output path: {destination_path} may be incomplete or empty.")
+                if os.path.exists(destination_path): # remove empty file if created
+                    os.remove(destination_path)
+                return None
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        if os.path.exists(destination_path): # Clean up partial file if error occurred
+            if os.path.getsize(destination_path) == 0 : # remove if empty
+                os.remove(destination_path)
+        return None
 
 
 def apply_text(
@@ -1057,11 +1212,30 @@ Please return a JSON object containing only the cleaned metadata:
 
 if __name__ == "__main__":
 
-    api_key = os.getenv("IM3_AZURE_OPENAI_API_KEY", default=None)
-    endpoint = os.getenv("IM3_AZURE_OPENAI_ENDPOINT", default=None)
+    api_key = os.getenv("AZURE_OPENAI_API_KEY", default=None)
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", default=None)
     deployment = "gpt-4o"
     openai_api_version = "2024-02-01"
 
+    # file to process
+    forms_file = "/Users/d3y010/repos/github/modelcard/data/eesm_modelcard_responses.xlsx"
+
+    df = pd.read_excel(forms_file)
+
+    df.columns = [
+        "timestamp",
+        "submitter_email",
+        "sponsoring_project",
+        "capability_name",
+        "capabiity_type",
+        "code_repository",
+        "branch",
+        "data_repository",
+        "additional_documents",
+        "website"
+    ]
+
+    # PROCESS INDIVIDUAL ROW PER MODEL CARD
     llm = AzureChatOpenAI(
         model_name="gpt-4o", 
         temperature=0.1, 
@@ -1115,10 +1289,27 @@ if __name__ == "__main__":
     # Compile the graph
     app = workflow.compile()
 
-    # --- Run the Graph ---
+    # download files if there are any
+    if np.isnan(df.data_repository.iloc[0]):
+        files_to_download = None 
+    else:
+        files_to_download = df.additional_documents.iloc[0].split(",")
+
+    if files_to_download:
+        for i in files_to_download:
+            destination_url = f"{i.split("id=")[-1]}.pdf"
+            downloaded_file_url = download_gdrive_public_file(i, destination_url)
+
+    nm = df.capability_name.iloc[0]
+
+    # Ensure publication directory exists
+    pub_dir = f"./data/{nm}"
+    if not os.path.exists(pub_dir):
+        os.makedirs(pub_dir)
+
     inputs = {
-        "github_url": "https://github.com/ClimateGlobalChange/tempestextremes",
-        "github_branch": "master",
+        "github_url": df.code_repository.iloc[0],
+        "github_branch": df.branch.iloc[0],
         "extracted_info": {},
         "raw_extracted_info": {},
         "error_messages": [],
@@ -1132,11 +1323,11 @@ if __name__ == "__main__":
         "github_repository_errors": [],
         "handled_errors": [],
         "llm_client": llm,
-        "website_url": "https://climate.ucdavis.edu/tempestextremes.php",
+        "website_url": df.website.iloc[0], 
         "website_content": None,
         "website_errors": [],
         "website_extracted_info": {},
-        "publication_directory": "./data/publications",
+        "publication_directory": f"./data/{nm}",
         "publication_content": None,
         "publication_extracted_info": {},
         "publication_errors": [],
@@ -1177,3 +1368,292 @@ if __name__ == "__main__":
             print("Validation Issues:", final_issues)
         
         print("Partial Card Data:", final_card_data) # Uncomment to see potentially invalid data
+
+
+    # Paths
+    template_path = "./data/model_card_template.pptx"
+    output_path   = "./data/model_card_filled.pptx"
+
+    # Load the presentation
+    prs = Presentation(template_path)
+
+    description_slide_index = 0 # slide 1
+    details_slide_index = 1 # slide 2
+
+    project_logos = {
+        "hyperfacets": "/Users/d3y010/repos/github/modelcard/data/project_logos/hyperfacets.png",
+        "im3": "/Users/d3y010/repos/github/modelcard/data/project_logos/im3.png",
+    }
+
+    # from source inputs
+    project_logos = "Sponsoring Project Logos"
+    github_repo = final_card_data.get("github_url")
+
+    # from AI agents
+    capability_name = final_card_data.get("capability_name", None)
+    brief_description = final_card_data.get("brief_description", None)
+    contact_name = final_card_data.get("contact_name", "Contact Name")
+    contact_email = final_card_data.get("contact_email", "Contact Email")
+    current_version = final_card_data.get("current_version", None)
+    license = final_card_data.get("license", None)
+
+    # make this not include contact person
+    key_contributors = final_card_data.get("key_contributors", None)
+    key_contributors_additional = ", et al." if len(key_contributors) > 3 else ""
+
+    doi = final_card_data.get("doi", None)
+    category = ", ".join(final_card_data.get("category", [""]))
+    systems_covered = final_card_data.get("systems_covered", "")
+    computational_requirements = final_card_data.get("computational_requirements", "")
+    spatial_resolution = ", ".join(final_card_data.get("spatial_resolution", ""))
+    geographic_scope = final_card_data.get("geographic_scope", "")
+    temporal_resolution = ", ".join(final_card_data.get("temporal_resolution", [""]))
+    temporal_range = ", ".join(final_card_data.get("temporal_range", [""]))
+    input_variables = ", ".join(final_card_data.get("input_variables", [""]))
+    output_variables = ", ".join(final_card_data.get("output_variables", [""]))
+    interdependencies = ", ".join(final_card_data.get("interdependencies", [""]))
+
+    # limit publication number
+    n_publications_max = 3
+    key_publications = "\n".join(final_card_data.get("key_publications", [""])[:n_publications_max])
+
+    # modify agent to only use figs on web
+    # optional_figure_url = "https://climate.ucdavis.edu/TempestExtremesLogo.png"
+    # figure_caption = "TempestExtremes provides algorithms implemented in C++ for tracking and characterizing tropical cyclones (TCs), extratropical cyclones (ETCs), monsoonal depressions, atmospheric blocks, atmospheric rivers, and mesoscale convective systems (MCSs)."
+
+    # modify agent to select model, tool, or dataset
+    capability_type = f"Tool (Current Version: {current_version})"
+
+
+    capability_name_index = 1 
+    brief_description_index = 2 
+    contact_index = 3 
+    project_logo_index = 4
+    access_block_index = 5
+    optional_figure_index = 6
+    figure_caption_index = 7
+    capability_type_index = 8
+    current_version_index = 10
+
+    # capability name
+    apply_text(
+        slide_index=description_slide_index,
+        shape_index=capability_name_index,
+        text=capability_name,
+        font_size=38,
+        font_italic=True
+    )
+
+    # capability type
+    apply_text(
+        slide_index=description_slide_index,
+        shape_index=capability_type_index,
+        text=capability_type,
+        font_size=18,
+        font_italic=True
+    )
+
+    # description
+    brief_description_block = (
+        "Brief Description:\n"
+        f"{brief_description}"
+    )
+
+    apply_text(
+        slide_index=description_slide_index,
+        shape_index=brief_description_index,
+        text=brief_description_block,
+        font_size=18,
+        font_italic=False,
+        bold_items=["Brief Description"]
+
+    )
+
+    # contact and key contributors
+    n_contributors_max = 3
+    contact_block = (
+        "Contact:\n"
+        f"{contact_name}, {contact_email}\n\n"
+        "Key Contributors:\n"
+        f"{', '.join(key_contributors[:n_contributors_max])}{key_contributors_additional}"
+    )
+
+    apply_text(
+        slide_index=description_slide_index,
+        shape_index=contact_index,
+        text=contact_block,
+        font_size=14,
+        font_italic=False,
+        bold_items=["Contact", "Key Contributors"]
+    )
+
+    # repository and DOI
+    access_block = (
+        "\nRepository:\n"
+        f"{github_repo}\n\n"
+        "DOI:\n"
+        f"{doi}\n\n"
+        "License:\n"
+        f"{license}\n"
+    )
+
+    apply_text(
+        slide_index=description_slide_index,
+        shape_index=access_block_index,
+        text=access_block,
+        font_size=13,
+        font_italic=False,
+        bold_items=["Repository", "DOI", "License"]
+    )
+
+    # figure
+    apply_figure(
+        slide_index=description_slide_index,
+        shape_index=optional_figure_index,
+        image_url=optional_figure_url
+    )
+
+    # figure caption
+    apply_text(
+        slide_index=description_slide_index,
+        shape_index=figure_caption_index,
+        text=figure_caption,
+        font_size=13,
+        font_italic=False,
+    )
+
+    details_capability_name_index = 1
+    details_sponsoring_project_logos_index = 2
+    details_capability_type_index = 3
+    details_current_version_index = 3
+    details_table_index = 5
+    details_table_category = [0, 1]
+    details_table_systems_covered = [1, 1]
+    details_table_computational_requirements = [2, 1]
+    details_table_spatial_resolution = [3, 1]
+    details_table_geographic_scope = [4, 1]
+    details_table_temporal_resolution = [5, 1]
+    details_table_temporal_range = [6, 1]
+    details_table_input_variables = [7, 1]
+    details_table_output_variables = [8, 1]
+    details_table_interdependencies = [9, 1]
+    details_table_key_publications = [10, 1]
+
+    # title
+    apply_text(
+        slide_index=details_slide_index,
+        shape_index=details_capability_name_index,
+        text=capability_name,
+        font_size=38,
+        font_italic=True
+    )
+
+    # capability type
+    apply_text(
+        slide_index=details_slide_index,
+        shape_index=details_capability_type_index,
+        text=capability_type,
+        font_size=18,
+        font_italic=True
+    )
+
+    # systems_covered
+    apply_table_cell(
+        slide_index=details_slide_index,
+        shape_index=details_table_index,
+        row_index=details_table_category[0],
+        column_index=details_table_category[1],
+        text=category
+    )
+
+    # systems_covered
+    apply_table_cell(
+        slide_index=details_slide_index,
+        shape_index=details_table_index,
+        row_index=details_table_systems_covered[0],
+        column_index=details_table_systems_covered[1],
+        text=systems_covered
+    )
+
+    # computational requirements
+    apply_table_cell(
+        slide_index=details_slide_index,
+        shape_index=details_table_index,
+        row_index=details_table_computational_requirements[0],
+        column_index=details_table_computational_requirements[1],
+        text=computational_requirements
+    )
+
+    # spatial_resolution
+    apply_table_cell(
+        slide_index=details_slide_index,
+        shape_index=details_table_index,
+        row_index=details_table_spatial_resolution[0],
+        column_index=details_table_spatial_resolution[1],
+        text=spatial_resolution
+    )
+
+    # geographic_scope
+    apply_table_cell(
+        slide_index=details_slide_index,
+        shape_index=details_table_index,
+        row_index=details_table_geographic_scope[0],
+        column_index=details_table_geographic_scope[1],
+        text=geographic_scope
+    )
+
+    # temporal_resolution
+    apply_table_cell(
+        slide_index=details_slide_index,
+        shape_index=details_table_index,
+        row_index=details_table_temporal_resolution[0],
+        column_index=details_table_temporal_resolution[1],
+        text=temporal_resolution
+    )
+
+    # temporal_range
+    apply_table_cell(
+        slide_index=details_slide_index,
+        shape_index=details_table_index,
+        row_index=details_table_temporal_range[0],
+        column_index=details_table_temporal_range[1],
+        text=temporal_range
+    )
+
+    # input_variables
+    apply_table_cell(
+        slide_index=details_slide_index,
+        shape_index=details_table_index,
+        row_index=details_table_input_variables[0],
+        column_index=details_table_input_variables[1],
+        text=input_variables
+    )
+
+    # output_variables
+    apply_table_cell(
+        slide_index=details_slide_index,
+        shape_index=details_table_index,
+        row_index=details_table_output_variables[0],
+        column_index=details_table_output_variables[1],
+        text=output_variables
+    )
+
+    # interdependencies
+    apply_table_cell(
+        slide_index=details_slide_index,
+        shape_index=details_table_index,
+        row_index=details_table_interdependencies[0],
+        column_index=details_table_interdependencies[1],
+        text=interdependencies
+    )
+
+    # key_publications
+    apply_table_cell(
+        slide_index=details_slide_index,
+        shape_index=details_table_index,
+        row_index=details_table_key_publications[0],
+        column_index=details_table_key_publications[1],
+        text=key_publications
+    )
+ 
+    prs.save(output_path)

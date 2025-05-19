@@ -16,6 +16,7 @@ import pdfplumber
 import tempfile
 from datetime import datetime
 
+
 # Configure root logger
 logging.basicConfig(
     level=logging.INFO,
@@ -94,6 +95,24 @@ class GraphState(TypedDict):
     model_card: Optional[Dict]
     error_messages: List[str]
     validation_issues: Dict
+
+
+
+def clean_html(text: str) -> str:
+    # Remove script and style elements
+    text = re.sub(r'<(script|style).*?>.*?</\\1>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    # Strip all other HTML tags
+    text = re.sub(r'<[^>]+>', '', text)
+    # Replace common HTML entities
+    text = re.sub(r'&nbsp;', ' ', text)
+    text = re.sub(r'&amp;', '&', text)
+    text = re.sub(r'&lt;', '<', text)
+    text = re.sub(r'&gt;', '>', text)
+    text = re.sub(r'&quot;', '"', text)
+    text = re.sub(r'&#39;', "'", text)
+    # Collapse whitespace
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
 
 
 # ------------------------------------
@@ -313,6 +332,7 @@ def fetch_github(
             converted_docs = []
             for doc in raw_docs:
                 source = doc.metadata.get('source', '')
+
                 if source.lower().endswith('.pdf'):
                     try:
                         with pdfplumber.open(source) as pdf:
@@ -327,17 +347,21 @@ def fetch_github(
                 else:
                     converted_docs.append(doc)
             raw_docs = converted_docs
+
             # Filter raw_docs by allowed file extensions and LICENSE files
             filtered_docs = []
             for doc in raw_docs:
                 source = doc.metadata.get('source', '')
                 _, ext = os.path.splitext(source)
                 name = os.path.basename(source)
+
                 # Keep by extension or include LICENSE files
                 if ext.casefold() in file_extensions \
                    or name.lower() in ('license', 'license.md', 'license.txt'):
                     filtered_docs.append(doc)
+
             docs = text_splitter.split_documents(filtered_docs)
+            
             logging.info(f"Processed {len(docs)} docs from GitHub.")
         else:
             logging.warning("No documents loaded or processed from GitHub due to errors.")
@@ -402,9 +426,14 @@ def fetch_documentation(
                     timeout=timeout,
                 )
                 raw_docs = loader.load()
+
+                # Clean HTML content for each document before splitting
+                for doc in raw_docs:
+                    doc.page_content = clean_html(doc.page_content)
                 split = text_splitter.split_documents(raw_docs)
                 docs.extend(split)
                 logging.info(f"Fetched and split {len(split)} docs from Docs URL: {url}")
+
             except Exception as e:
                 logging.error(f"ERROR fetching Docs URL {url}: {e}")
                 tb_str = traceback.format_exc()
@@ -419,7 +448,7 @@ def fetch_documentation(
     }
 
 
-def fetch_publications(
+def fetch_highly_cited_publications(
         state: GraphState,
         max_context_length: int = 16000,
         max_chars_per_query = 2000,
@@ -441,7 +470,7 @@ def fetch_publications(
     Returns:
         dict: A dictionary with updated 'extracted_info' and a list of 'error_messages'.
     """
-    logging.info("--- Node: fetch_publications ---")
+    logging.info("--- Node: fetch_highly_cited_publications ---")
 
     # Read flag for web searching publications; default False
     search_web = state.get('search_web_for_publications', False)
@@ -577,6 +606,9 @@ def information_extraction(state: GraphState) -> Dict:
     """
     logging.info("--- Node: extract_info ---")
     docs = state.get('github_docs', []) or []
+    # Clean any residual HTML tags from document content before tokenization
+    for doc in docs:
+        doc.page_content = clean_html(doc.page_content or "")
     # Log token counts per file extension
     try:
         # Use the LLM's model name to select the correct encoding
@@ -1012,8 +1044,10 @@ def synthesize_and_validate(state: GraphState) -> Dict:
             - 'error_messages': Any error messages encountered, including validation failures.
     """
     logging.info("--- Node: synthesize_validate ---")
+
     errors = state.get('error_messages', []) or []
     extracted_info = state.get('extracted_info', {}) or {}
+    
     # Coerce None values for string fields to "N/A" to satisfy Pydantic string requirements
     for key in ['contact_email', 'license']:
         if extracted_info.get(key) is None:
@@ -1150,13 +1184,13 @@ if __name__ == "__main__":
         azure_endpoint=endpoint,
     )
 
-    embeddings = AzureOpenAIEmbeddings(
-        model="text-embedding-3-large",
-        azure_endpoint=endpoint,
-        api_key=api_key,
-        openai_api_version=openai_api_version,
-        chunk_size=512
-    )
+    # embeddings = AzureOpenAIEmbeddings(
+    #     model="text-embedding-3-large",
+    #     azure_endpoint=endpoint,
+    #     api_key=api_key,
+    #     openai_api_version=openai_api_version,
+    #     chunk_size=512
+    # )
 
     # Initialize search tool (choose one)
     # search_tool = TavilySearchResults(max_results=5)
@@ -1168,7 +1202,7 @@ if __name__ == "__main__":
     workflow.add_node("fetch_github", fetch_github)
     workflow.add_node("strip_code_bodies", strip_code_bodies)
     workflow.add_node("extract_info", information_extraction)
-    workflow.add_node("fetch_publications", fetch_publications)
+    workflow.add_node("fetch_highly_cited_publications", fetch_highly_cited_publications)
     workflow.add_node("fetch_publication_pdfs", fetch_publication_pdfs)
     workflow.add_node("fetch_documentation", fetch_documentation)
     workflow.add_node("refine_card_from_pdfs", refine_card_from_pdfs)
@@ -1183,8 +1217,8 @@ if __name__ == "__main__":
     workflow.add_edge("fetch_github", "fetch_latest_release")
     workflow.add_edge("fetch_latest_release", "strip_code_bodies")
     workflow.add_edge("strip_code_bodies", "extract_info")
-    workflow.add_edge("extract_info", "fetch_publications")
-    workflow.add_edge("fetch_publications", "fetch_documentation")
+    workflow.add_edge("extract_info", "fetch_highly_cited_publications")
+    workflow.add_edge("fetch_highly_cited_publications", "fetch_documentation")
     workflow.add_edge("fetch_documentation", "fetch_publication_pdfs")
     workflow.add_edge("fetch_publication_pdfs", "refine_card_from_pdfs")
     workflow.add_edge("refine_card_from_pdfs", "refine_card_from_webdata")
