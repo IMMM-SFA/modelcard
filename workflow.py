@@ -275,7 +275,6 @@ def download_gdrive_public_file(file_id_or_url, destination_path):
 
 
 def apply_text(
-    prs: Presentation,
     slide_index: int,
     shape_index: int,
     text: str,
@@ -307,7 +306,6 @@ def apply_text(
 
 
 def apply_figure(
-    prs: Presentation,
     slide_index: int,
     shape_index: int,
     image_url: str,
@@ -353,7 +351,6 @@ def apply_figure(
 
 
 def apply_table_cell(
-    prs: Presentation,
     slide_index: int,
     shape_index: int,
     row_index: int,
@@ -1406,7 +1403,11 @@ if __name__ == "__main__":
     systems_covered = final_card_data.get("systems_covered", "")
     computational_requirements = final_card_data.get("computational_requirements", "")
     spatial_resolution = ", ".join(final_card_data.get("spatial_resolution", ""))
-    geographic_scope = final_card_data.get("geographic_scope", "")
+    gs = final_card_data.get("geographic_scope", "")
+    if isinstance(gs, list):
+        geographic_scope = ", ".join(gs)
+    else:
+        geographic_scope = gs
     temporal_resolution = ", ".join(final_card_data.get("temporal_resolution", [""]))
     temporal_range = ", ".join(final_card_data.get("temporal_range", [""]))
     input_variables = ", ".join(final_card_data.get("input_variables", [""]))
@@ -1418,12 +1419,11 @@ if __name__ == "__main__":
     key_publications = "\n".join(final_card_data.get("key_publications", [""])[:n_publications_max])
 
     # modify agent to only use figs on web
-    # optional_figure_url = "https://climate.ucdavis.edu/TempestExtremesLogo.png"
-    # figure_caption = "TempestExtremes provides algorithms implemented in C++ for tracking and characterizing tropical cyclones (TCs), extratropical cyclones (ETCs), monsoonal depressions, atmospheric blocks, atmospheric rivers, and mesoscale convective systems (MCSs)."
+    optional_figure_url = "https://climate.ucdavis.edu/TempestExtremesLogo.png"
+    figure_caption = "TempestExtremes provides algorithms implemented in C++ for tracking and characterizing tropical cyclones (TCs), extratropical cyclones (ETCs), monsoonal depressions, atmospheric blocks, atmospheric rivers, and mesoscale convective systems (MCSs)."
 
     # modify agent to select model, tool, or dataset
     capability_type = f"Tool (Current Version: {current_version})"
-
 
     capability_name_index = 1 
     brief_description_index = 2 
